@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { resolveSenderLabel } from "../../channels/sender-label.js";
 import { formatZonedTimestamp } from "../../infra/format-time/format-datetime.js";
@@ -42,6 +43,31 @@ function resolveInboundChannel(ctx: TemplateContext): string | undefined {
   return channelValue;
 }
 
+function shouldPseudonymizeInbound(ctx: TemplateContext): boolean {
+  const enabled = (process.env.OPENCLAW_PSEUDONYMIZE_INBOUND_META ?? "true").toLowerCase() !== "false";
+  if (!enabled) {
+    return false;
+  }
+  const whatsappOnly =
+    (process.env.OPENCLAW_PSEUDONYMIZE_INBOUND_WHATSAPP_ONLY ?? "true").toLowerCase() !== "false";
+  if (!whatsappOnly) {
+    return true;
+  }
+  const channel = resolveInboundChannel(ctx)?.toLowerCase();
+  return channel === "whatsapp";
+}
+
+function pseudonym(scope: string, raw?: string): string | undefined {
+  const value = safeTrim(raw);
+  if (!value) {
+    return undefined;
+  }
+  const secret =
+    process.env.OPENCLAW_INBOUND_META_HMAC_SECRET ?? process.env.OPENCLAW_GATEWAY_TOKEN ?? "openclaw-default-local-secret";
+  const digest = createHmac("sha256", secret).update(`${scope}:${value}`).digest("hex").slice(0, 20);
+  return `${scope}_${digest}`;
+}
+
 export function buildInboundMetaSystemPrompt(ctx: TemplateContext): string {
   const chatType = normalizeChatType(ctx.ChatType);
   const isDirect = !chatType || chatType === "direct";
@@ -57,9 +83,11 @@ export function buildInboundMetaSystemPrompt(ctx: TemplateContext): string {
   // omit the channel field entirely rather than falling back to an unrelated provider.
   const channelValue = resolveInboundChannel(ctx);
 
+  const pseudo = shouldPseudonymizeInbound(ctx);
+
   const payload = {
     schema: "openclaw.inbound_meta.v1",
-    chat_id: safeTrim(ctx.OriginatingTo),
+    chat_id: pseudo ? pseudonym("chat", safeTrim(ctx.OriginatingTo)) : safeTrim(ctx.OriginatingTo),
     account_id: safeTrim(ctx.AccountId),
     channel: channelValue,
     provider: safeTrim(ctx.Provider),
@@ -95,17 +123,25 @@ export function buildInboundUserContextPrefix(ctx: TemplateContext): string {
   const messageIdFull = safeTrim(ctx.MessageSidFull);
   const resolvedMessageId = messageId ?? messageIdFull;
   const timestampStr = formatConversationTimestamp(ctx.Timestamp);
+  const pseudo = shouldPseudonymizeInbound(ctx);
+
+  const rawSenderId = safeTrim(ctx.SenderId);
+  const rawSenderName = safeTrim(ctx.SenderName);
+  const rawSenderE164 = safeTrim(ctx.SenderE164);
+  const rawSenderUsername = safeTrim(ctx.SenderUsername);
+  const rawSenderTag = safeTrim(ctx.SenderTag);
+  const rawSenderLabel =
+    rawSenderName ?? rawSenderE164 ?? rawSenderId ?? rawSenderUsername;
 
   const conversationInfo = {
     message_id: shouldIncludeConversationInfo ? resolvedMessageId : undefined,
     reply_to_id: shouldIncludeConversationInfo ? safeTrim(ctx.ReplyToId) : undefined,
-    sender_id: shouldIncludeConversationInfo ? safeTrim(ctx.SenderId) : undefined,
+    sender_id: shouldIncludeConversationInfo
+      ? (pseudo ? pseudonym("sender", rawSenderId) : rawSenderId)
+      : undefined,
     conversation_label: isDirect ? undefined : safeTrim(ctx.ConversationLabel),
     sender: shouldIncludeConversationInfo
-      ? (safeTrim(ctx.SenderName) ??
-        safeTrim(ctx.SenderE164) ??
-        safeTrim(ctx.SenderId) ??
-        safeTrim(ctx.SenderUsername))
+      ? (pseudo ? pseudonym("sender_label", rawSenderLabel) : rawSenderLabel)
       : undefined,
     timestamp: timestampStr,
     group_subject: safeTrim(ctx.GroupSubject),
@@ -136,18 +172,29 @@ export function buildInboundUserContextPrefix(ctx: TemplateContext): string {
   }
 
   const senderInfo = {
-    label: resolveSenderLabel({
-      name: safeTrim(ctx.SenderName),
-      username: safeTrim(ctx.SenderUsername),
-      tag: safeTrim(ctx.SenderTag),
-      e164: safeTrim(ctx.SenderE164),
-      id: safeTrim(ctx.SenderId),
-    }),
-    id: safeTrim(ctx.SenderId),
-    name: safeTrim(ctx.SenderName),
-    username: safeTrim(ctx.SenderUsername),
-    tag: safeTrim(ctx.SenderTag),
-    e164: safeTrim(ctx.SenderE164),
+    label: pseudo
+      ? pseudonym(
+          "sender_label",
+          resolveSenderLabel({
+            name: rawSenderName,
+            username: rawSenderUsername,
+            tag: rawSenderTag,
+            e164: rawSenderE164,
+            id: rawSenderId,
+          }),
+        )
+      : resolveSenderLabel({
+          name: rawSenderName,
+          username: rawSenderUsername,
+          tag: rawSenderTag,
+          e164: rawSenderE164,
+          id: rawSenderId,
+        }),
+    id: pseudo ? pseudonym("sender", rawSenderId) : rawSenderId,
+    name: pseudo ? undefined : rawSenderName,
+    username: pseudo ? undefined : rawSenderUsername,
+    tag: pseudo ? undefined : rawSenderTag,
+    e164: pseudo ? undefined : rawSenderE164,
   };
   if (senderInfo?.label) {
     blocks.push(
@@ -175,7 +222,9 @@ export function buildInboundUserContextPrefix(ctx: TemplateContext): string {
         "```json",
         JSON.stringify(
           {
-            sender_label: safeTrim(ctx.ReplyToSender),
+            sender_label: pseudo
+              ? pseudonym("reply_sender", safeTrim(ctx.ReplyToSender))
+              : safeTrim(ctx.ReplyToSender),
             is_quote: ctx.ReplyToIsQuote === true ? true : undefined,
             body: ctx.ReplyToBody,
           },
@@ -194,11 +243,17 @@ export function buildInboundUserContextPrefix(ctx: TemplateContext): string {
         "```json",
         JSON.stringify(
           {
-            from: safeTrim(ctx.ForwardedFrom),
+            from: pseudo ? pseudonym("fwd_from", safeTrim(ctx.ForwardedFrom)) : safeTrim(ctx.ForwardedFrom),
             type: safeTrim(ctx.ForwardedFromType),
-            username: safeTrim(ctx.ForwardedFromUsername),
-            title: safeTrim(ctx.ForwardedFromTitle),
-            signature: safeTrim(ctx.ForwardedFromSignature),
+            username: pseudo
+              ? pseudonym("fwd_user", safeTrim(ctx.ForwardedFromUsername))
+              : safeTrim(ctx.ForwardedFromUsername),
+            title: pseudo
+              ? pseudonym("fwd_title", safeTrim(ctx.ForwardedFromTitle))
+              : safeTrim(ctx.ForwardedFromTitle),
+            signature: pseudo
+              ? pseudonym("fwd_sig", safeTrim(ctx.ForwardedFromSignature))
+              : safeTrim(ctx.ForwardedFromSignature),
             chat_type: safeTrim(ctx.ForwardedFromChatType),
             date_ms: typeof ctx.ForwardedDate === "number" ? ctx.ForwardedDate : undefined,
           },
@@ -217,7 +272,7 @@ export function buildInboundUserContextPrefix(ctx: TemplateContext): string {
         "```json",
         JSON.stringify(
           ctx.InboundHistory.map((entry) => ({
-            sender: entry.sender,
+            sender: pseudo ? pseudonym("history_sender", entry.sender) : entry.sender,
             timestamp_ms: entry.timestamp,
             body: entry.body,
           })),
